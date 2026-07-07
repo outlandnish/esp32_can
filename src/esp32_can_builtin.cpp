@@ -267,21 +267,38 @@ bool IRAM_ATTR ESP32CAN::onRxDone(twai_node_handle_t handle,
 
     if (twai_node_receive_from_isr(handle, &raw) != ESP_OK) return false;
 
+    // The received payload length comes from the DLC code (buffer_len is only
+    // the capacity we passed in). twaifd_dlc2len maps FD DLC codes to bytes.
+    uint16_t rxLen = twaifd_dlc2len(raw.header.dlc);
+
     CAN_FRAME msg;
     msg.id       = raw.header.id;
     msg.extended = raw.header.ide;
     msg.rtr      = raw.header.rtr;
-    // buffer_len holds actual received byte count
-    uint8_t rxLen = raw.header.dlc;
     msg.length = (rxLen <= 8) ? rxLen : 8;
-    for (int i = 0; i < 8; i++) msg.data.byte[i] = (i < (int)raw.buffer_len) ? buf[i] : 0;
+    for (int i = 0; i < 8; i++) msg.data.byte[i] = (i < (int)rxLen) ? buf[i] : 0;
 
-    // processFrame touches FreeRTOS queues – safe from ISR via xQueueSendFromISR
-    // We replicate the filter logic inline to stay ISR-safe.
     espCan->cyclesSinceTraffic = 0;
     espCan->trafficEverSeen = true;
 
     BaseType_t woken = pdFALSE;
+
+#if defined(SOC_TWAI_SUPPORT_FD)
+    // Feed the FD queue in parallel for any FD frame, preserving the full
+    // payload and the fdf/brs flags that the classic downcast above discards.
+    if (raw.header.fdf && espCan->rx_queue_fd) {
+        CAN_FRAME_FD fd;
+        fd.id       = raw.header.id;
+        fd.extended = raw.header.ide;
+        fd.fdMode   = 1;
+        fd.rrs      = raw.header.brs ? 1 : 0;   // carry BRS in rrs (see header)
+        fd.length   = (rxLen <= 64) ? rxLen : 64;
+        for (int i = 0; i < 64; i++)
+            fd.data.uint8[i] = (i < (int)rxLen) ? buf[i] : 0;
+        xQueueSendFromISR(espCan->rx_queue_fd, &fd, &woken);
+    }
+#endif
+
     for (int i = 0; i < BI_NUM_FILTERS; i++) {
         if (!espCan->filters[i].configured) continue;
         if ((msg.id & espCan->filters[i].mask) == espCan->filters[i].id &&
@@ -425,11 +442,11 @@ void ESP32CAN::enable()
 #endif
 
     if (twai_new_node_onchip(&node_cfg, &node_handle) != ESP_OK) {
-        printf("[TWAI] Failed to create node (bus %d)\n", _busNum);
+        if (debuggingMode) printf("[TWAI] Failed to create node (bus %d)\n", _busNum);
         node_handle = nullptr;
         return;
     }
-    printf("[TWAI] Node created (bus %d, %lu bps)\n", _busNum, _baudrate);
+    if (debuggingMode) printf("[TWAI] Node created (bus %d, %lu bps)\n", _busNum, _baudrate);
 
     // Register callbacks
     twai_event_callbacks_t cbs = {};
@@ -442,6 +459,9 @@ void ESP32CAN::enable()
     // Create queues
     callbackQueue = xQueueCreate(16,          sizeof(CAN_FRAME));
     rx_queue      = xQueueCreate(rxBufferSize, sizeof(CAN_FRAME));
+#if defined(SOC_TWAI_SUPPORT_FD)
+    rx_queue_fd   = xQueueCreate(rxBufferSize, sizeof(CAN_FRAME_FD));
+#endif
 
     // Callback dispatcher task
     char taskName[24];
@@ -449,10 +469,10 @@ void ESP32CAN::enable()
     xTaskCreate(ESP32CAN::task_CAN, taskName, 8192, this, 15, &task_CAN_handler);
 
     if (twai_node_enable(node_handle) == ESP_OK) {
-        printf("[TWAI] Node enabled (bus %d)\n", _busNum);
+        if (debuggingMode) printf("[TWAI] Node enabled (bus %d)\n", _busNum);
         readyForTraffic = true;
     } else {
-        printf("[TWAI] Failed to enable node (bus %d)\n", _busNum);
+        if (debuggingMode) printf("[TWAI] Failed to enable node (bus %d)\n", _busNum);
     }
 }
 
@@ -475,6 +495,12 @@ void ESP32CAN::disable()
         vQueueDelete(rx_queue);
         rx_queue = nullptr;
     }
+#if defined(SOC_TWAI_SUPPORT_FD)
+    if (rx_queue_fd) {
+        vQueueDelete(rx_queue_fd);
+        rx_queue_fd = nullptr;
+    }
+#endif
     if (callbackQueue) {
         vQueueDelete(callbackQueue);
         callbackQueue = nullptr;
@@ -631,7 +657,9 @@ bool ESP32CAN::sendFrameFD(CAN_FRAME_FD &txFrame)
     raw[slot].header.ide = txFrame.extended ? 1 : 0;
     raw[slot].header.rtr = 0;
     raw[slot].header.fdf = 1;  // FD frame
-    raw[slot].header.brs = (_dataBaudrate > 0) ? 1 : 0; // bit-rate switch
+    // Per-frame BRS: caller sets txFrame.rrs to request bit-rate switching.
+    // BRS still needs a data baudrate configured (setDataBaudrate before init).
+    raw[slot].header.brs = (txFrame.rrs && _dataBaudrate > 0) ? 1 : 0;
     raw[slot].buffer     = buf;
     raw[slot].buffer_len = len;
 
@@ -640,10 +668,19 @@ bool ESP32CAN::sendFrameFD(CAN_FRAME_FD &txFrame)
 
 uint32_t ESP32CAN::get_rx_buffFD(CAN_FRAME_FD &msg)
 {
-    // FD frames arriving via onRxDone are currently downcast to CAN_FRAME
-    // (8-byte cap) in the ISR. To receive full FD frames you would need a
-    // separate rx_queue_fd and a matching ISR path. This is a placeholder.
+    if (!rx_queue_fd || !uxQueueMessagesWaiting(rx_queue_fd)) return false;
+    CAN_FRAME_FD frame;
+    if (xQueueReceive(rx_queue_fd, &frame, 0) == pdTRUE) {
+        msg = frame;
+        return true;
+    }
     return false;
+}
+
+uint16_t ESP32CAN::availableFD()
+{
+    if (!rx_queue_fd) return 0;
+    return (uint16_t)uxQueueMessagesWaiting(rx_queue_fd);
 }
 #endif
 
@@ -833,7 +870,7 @@ void ESP32CAN::enable()
 
     if (twai_driver_install_v2(&twai_general_cfg, &twai_speed_cfg,
                                 &twai_filters_cfg, &bus_handle) != ESP_OK) {
-        printf("[TWAI] Failed to install driver (bus %d)\n", _busNum);
+        if (debuggingMode) printf("[TWAI] Failed to install driver (bus %d)\n", _busNum);
         return;
     }
 
@@ -854,10 +891,10 @@ void ESP32CAN::enable()
 #endif
 
     if (twai_start_v2(bus_handle) != ESP_OK) {
-        printf("[TWAI] Failed to start driver (bus %d)\n", _busNum);
+        if (debuggingMode) printf("[TWAI] Failed to start driver (bus %d)\n", _busNum);
         return;
     }
-    printf("[TWAI] Driver started (bus %d)\n", _busNum);
+    if (debuggingMode) printf("[TWAI] Driver started (bus %d)\n", _busNum);
     readyForTraffic = true;
 }
 
@@ -943,7 +980,7 @@ uint32_t ESP32CAN::set_baudrate(uint32_t ul_baudrate)
             return ul_baudrate;
         }
     }
-    printf("[TWAI] Could not find valid bit timing for %lu bps!\n", ul_baudrate);
+    if (debuggingMode) printf("[TWAI] Could not find valid bit timing for %lu bps!\n", ul_baudrate);
     return 0;
 }
 
@@ -1081,7 +1118,7 @@ void ESP32CAN::CAN_WatchDog_Builtin(void *pvParameters)
             if (status_info.state == TWAI_STATE_BUS_OFF) {
                 espCan->cyclesSinceTraffic = 0;
                 if (twai_initiate_recovery() != ESP_OK) {
-                    printf("[TWAI] Could not initiate bus recovery!\n");
+                    if (debuggingMode) printf("[TWAI] Could not initiate bus recovery!\n");
                 }
             }
         }
@@ -1119,7 +1156,7 @@ void ESP32CAN::enable()
 
     if (twai_driver_install(&twai_general_cfg, &twai_speed_cfg,
                              &twai_filters_cfg) != ESP_OK) {
-        printf("[TWAI] Failed to install driver\n");
+        if (debuggingMode) printf("[TWAI] Failed to install driver\n");
         return;
     }
 
@@ -1135,10 +1172,10 @@ void ESP32CAN::enable()
 #endif
 
     if (twai_start() != ESP_OK) {
-        printf("[TWAI] Failed to start driver\n");
+        if (debuggingMode) printf("[TWAI] Failed to start driver\n");
         return;
     }
-    printf("[TWAI] Driver started\n");
+    if (debuggingMode) printf("[TWAI] Driver started\n");
     readyForTraffic = true;
 }
 
@@ -1205,7 +1242,7 @@ uint32_t ESP32CAN::set_baudrate(uint32_t ul_baudrate)
             return ul_baudrate;
         }
     }
-    printf("[TWAI] Could not find valid bit timing for %lu bps!\n", ul_baudrate);
+    if (debuggingMode) printf("[TWAI] Could not find valid bit timing for %lu bps!\n", ul_baudrate);
     return 0;
 }
 

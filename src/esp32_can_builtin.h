@@ -103,6 +103,12 @@ public:
     // Shared queues (accessed by static callbacks/tasks)
     QueueHandle_t callbackQueue = nullptr;
     QueueHandle_t rx_queue      = nullptr;
+#if defined(TWAI_TIER_NEW) && defined(SOC_TWAI_SUPPORT_FD)
+    // Parallel queue carrying full CAN_FRAME_FD (up to 64 bytes + fdf/brs), fed
+    // alongside rx_queue by onRxDone. Lets callers receive FD frames without the
+    // 8-byte downcast the classic rx_queue applies.
+    QueueHandle_t rx_queue_fd   = nullptr;
+#endif
 
     // Traffic watchdog counter (reset by RX path)
     volatile int cyclesSinceTraffic = 0;
@@ -125,8 +131,18 @@ public:
 
 // CAN-FD support (TIER_NEW / SOC_TWAI_SUPPORT_FD only)
 #if defined(TWAI_TIER_NEW) && defined(SOC_TWAI_SUPPORT_FD)
+    // sendFrameFD transmits an FD frame. Bit-rate switching (BRS) is taken from
+    // txFrame.rrs (non-zero = BRS on) so callers can choose per frame; BRS still
+    // requires a data baudrate to have been set via setDataBaudrate().
     bool sendFrameFD(CAN_FRAME_FD &txFrame) override;
+
+    // Receive a full FD frame from rx_queue_fd. Populates the 64-byte payload,
+    // fdMode, and carries the received BRS bit in msg.rrs. Returns true if a
+    // frame was dequeued.
     uint32_t get_rx_buffFD(CAN_FRAME_FD &msg) override;
+
+    // Number of FD frames waiting in rx_queue_fd.
+    uint16_t availableFD();
 
     // Call this before init() to enable the FD data phase
     void setDataBaudrate(uint32_t dataBaudrate) { _dataBaudrate = dataBaudrate; }
