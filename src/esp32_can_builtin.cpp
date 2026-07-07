@@ -284,18 +284,23 @@ bool IRAM_ATTR ESP32CAN::onRxDone(twai_node_handle_t handle,
     BaseType_t woken = pdFALSE;
 
 #if defined(SOC_TWAI_SUPPORT_FD)
-    // Feed the FD queue in parallel for any FD frame, preserving the full
-    // payload and the fdf/brs flags that the classic downcast above discards.
-    if (raw.header.fdf && espCan->rx_queue_fd) {
-        CAN_FRAME_FD fd;
-        fd.id       = raw.header.id;
-        fd.extended = raw.header.ide;
-        fd.fdMode   = 1;
-        fd.rrs      = raw.header.brs ? 1 : 0;   // carry BRS in rrs (see header)
-        fd.length   = (rxLen <= 64) ? rxLen : 64;
-        for (int i = 0; i < 64; i++)
-            fd.data.uint8[i] = (i < (int)rxLen) ? buf[i] : 0;
-        xQueueSendFromISR(espCan->rx_queue_fd, &fd, &woken);
+    // Route FD frames to the FD queue (full 64-byte payload + fdf/brs) rather
+    // than the classic rx_queue, which can only hold an 8-byte downcast. A
+    // classic-only consumer never wants a silently-truncated FD frame, and an
+    // FD consumer gets the whole thing. Classic frames still go to rx_queue.
+    if (raw.header.fdf) {
+        if (espCan->rx_queue_fd) {
+            CAN_FRAME_FD fd;
+            fd.id       = raw.header.id;
+            fd.extended = raw.header.ide;
+            fd.fdMode   = 1;
+            fd.rrs      = raw.header.brs ? 1 : 0;   // carry BRS in rrs (see header)
+            fd.length   = (rxLen <= 64) ? rxLen : 64;
+            for (int i = 0; i < 64; i++)
+                fd.data.uint8[i] = (i < (int)rxLen) ? buf[i] : 0;
+            xQueueSendFromISR(espCan->rx_queue_fd, &fd, &woken);
+        }
+        return (woken == pdTRUE);
     }
 #endif
 
